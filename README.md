@@ -3,7 +3,7 @@
 A Claude Code mod for the desktop app: a compact band above the prompt and a Session deck pane that keep every local session in view.
 
 - **Band:** folder, branch, changed files, session time and cost estimate, context %, 5h/7d limits, prompt-cache state, running agents; Save (save-brain), Deck and Goal buttons.
-- **Cross-session alerts:** when another local session is waiting on a question or plan (🔔) or its prompt cache is about to go cold (⏳), the band shows that session's name with buttons that act in that session: Accept / Decline for a question, Decline for a plan, Save-brain / Compact for a cold cache. A pressed alert hides at once and comes back with a toast if the other session does not pick the press up.
+- **Cross-session alerts:** when another local session is waiting on a question or plan (🔔) or its prompt cache is about to go cold (⏳), the band shows that session's name with buttons that act in that session: Accept / Decline for a question, Decline for a plan, Save-brain / Compact for a cold cache. The name is the session's title in the app (else its first prompt, pasted blocks removed). Hovering an alert shows the full name and what it waits on; Open shows the whole question in a pane, where an option press answers it in that session (several questions or a multi-select: pick, then Send answers). Alerts raise no toast. A press hides the alert in every session's band (at once here, within one 15 s tick elsewhere); it comes back with a toast if the other session does not pick the press up.
 - **Session deck** (`/deck`): context, last turn and cache tiles, subagent lanes on a time axis, every live session, and an event log.
 - **Goal mode** (`/goal-mode on|off|status`): toggles an unattended flag file that auto-denies questions.
 

@@ -26,8 +26,19 @@ export type TurnStat = {
   costUsd: number | null
 }
 
+// One AskUserQuestion question as another session's pane draws it.
+export type Question = { question: string; header: string; options: string[]; multiSelect: boolean }
+
 // A call this session is waiting on the person for: a question or a plan.
-export type Waiting = { id: string; tool: string; summary: string; since: number; reason?: string }
+export type Waiting = {
+  id: string
+  tool: string
+  summary: string
+  since: number
+  reason?: string
+  // AskUserQuestion's questions, so another session can answer them; absent on older code.
+  questions?: Question[]
+}
 
 // One session's heartbeat file under ~/.claude/session-band/sessions/<id>.json.
 export type Beat = {
@@ -46,11 +57,13 @@ export type Beat = {
 // One press in another session's band, written to this session's inbox and run here.
 export type Command = {
   id: string
-  verb: 'compact' | 'save-brain' | 'accept' | 'decline'
+  verb: 'compact' | 'save-brain' | 'accept' | 'decline' | 'answer'
   // The Waiting.id an accept or decline answers; null for compact and save-brain.
   waitId: string | null
   from: string
   at: number
+  // An answer's chosen labels by question text, several comma-joined.
+  answers?: Record<string, string>
 }
 
 // A session that needs the person: waiting on them, or its prompt cache about to go cold.
@@ -98,6 +111,7 @@ declare module 'claude-code' {
       isWorking: boolean
       warned: string[]
       label: string | null
+      title: string | null
       peers: Shaped<Peer[]>
       pending: Waiting[]
       sessions: SessionRow[]
@@ -106,6 +120,8 @@ declare module 'claude-code' {
       turnCostStart: number | null
       saveBrainSentAt: number | null
       hiddenAlerts: string[]
+      alertPeer: string | null
+      choices: Record<string, string[]>
     }
   }
 }

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register } from 'claude-code'
 
-import type { AgentCard, Beat, Command, Limit, LogLine, Peer, SessionRow, Snapshot, Waiting } from '../types'
+import type { AgentCard, Beat, Command, Limit, LogLine, Peer, Question, SessionRow, Snapshot, Waiting } from '../types'
 import { branchChip, changedMark, pillOf, totalsMark, where } from './band-svg'
 import type { Piece, Pill } from './band-svg'
 import { drawDeck, PALETTES } from './deck-svg'
@@ -12,6 +12,8 @@ const lastTurn = atom({ plugin: 'session-band', key: 'lastTurn' } as const, null
 const isWorking = atom({ plugin: 'session-band', key: 'isWorking' } as const, false)
 const warned = atom({ plugin: 'session-band', key: 'warned' } as const, [])
 const label = atom({ plugin: 'session-band', key: 'label' } as const, null)
+// The session's name in the app (the transcript's latest custom-title), preferred over the first prompt.
+const title = atom({ plugin: 'session-band', key: 'title' } as const, null)
 const peers = atom({ plugin: 'session-band', key: 'peers' } as const, [], { shape: 'peers-4' })
 // Alerts pressed from this band, hidden until the peer moves on or the press is not picked up.
 const hiddenAlerts = atom({ plugin: 'session-band', key: 'hiddenAlerts' } as const, [])
@@ -21,8 +23,12 @@ const agents = atom({ plugin: 'session-band', key: 'agents' } as const, [])
 const log = atom({ plugin: 'session-band', key: 'log' } as const, [])
 const turnCostStart = atom({ plugin: 'session-band', key: 'turnCostStart' } as const, null)
 const saveBrainSentAt = atom({ plugin: 'session-band', key: 'saveBrainSentAt' } as const, null)
+// The peer the alert pane shows, and the options picked there so far by question text.
+const alertPeer = atom({ plugin: 'session-band', key: 'alertPeer' } as const, null)
+const choices = atom({ plugin: 'session-band', key: 'choices' } as const, {})
 
 const PANE = 'session-deck'
+const ALERT_PANE = 'session-alert'
 const SAVE_BRAIN_COOLDOWN_MS = 60_000
 const TICK_MS = 15_000
 // Another session's press lands within one poll; a command still unread after INBOX_STALE_MS failed.
@@ -54,6 +60,10 @@ const DECLINE_ANSWER = {
     'The user declined this plan from another session (session-band): stay in plan mode, end your turn ' +
     'and wait for their feedback.',
 }
+const answerText = (answers: Record<string, string>) =>
+  `The user answered from another session (session-band): ${Object.entries(answers)
+    .map(([question, label]) => `"${question}" → "${label}"`)
+    .join('; ')}. Go with these answers and carry on.`
 const ASK_DENY =
   'Goal mode is on (unattended.on): the user is away, do not ask. Pick the recommended option, ' +
   'mark it as decided on their behalf for them to review, and carry on.'
@@ -126,9 +136,11 @@ const git = async ($: EngineInterface, cwd: string, args: string[]) => {
 const home = async ($: EngineInterface) => (await $.env.get('HOME')) ?? ''
 const beatsDir = async ($: EngineInterface) => `${await home($)}/.claude/session-band/sessions`
 const inboxDir = async ($: EngineInterface, id: string) => `${await home($)}/.claude/session-band/inbox/${id}`
+// One empty file per alert pressed in any session's band: every band hides that alert.
+const handledDir = async ($: EngineInterface) => `${await home($)}/.claude/session-band/handled`
 
 // An accept or decline from another session's band settles the matching wait in this one.
-const remoteAnswers = new Map<string, (verb: 'accept' | 'decline') => void>()
+const remoteAnswers = new Map<string, (command: Command) => void>()
 
 // Same path the security gate checks: CLAUDE_UNATTENDED_FLAG, else ~/.claude/hooks/unattended.on.
 const flagPath = async ($: EngineInterface) =>
@@ -137,10 +149,14 @@ const flagPath = async ($: EngineInterface) =>
 // The flag file is the truth: it is global to every session and can change by hand.
 const isGoalModeOn = async ($: EngineInterface) => $.fs.exists(await flagPath($))
 
+// Decided inside the one update, so a tick and a turn hook racing on the same key warn once.
 const markWarned = async ($: EngineInterface, key: string) => {
-  if ((await read($, warned)).includes(key)) return false
-  await update($, warned, seen => [...seen, key].slice(-100))
-  return true
+  let isNew = false
+  await update($, warned, seen => {
+    isNew = !seen.includes(key)
+    return isNew ? [...seen, key].slice(-100) : seen
+  })
+  return isNew
 }
 
 const say = async ($: EngineInterface, text: string, lineTone: LogLine['tone'] = null) => {
@@ -182,23 +198,61 @@ const VERB_TEXT: Record<Command['verb'], string> = {
   'save-brain': 'Save-brain',
   accept: 'Accept',
   decline: 'Decline',
+  answer: 'Answer',
 }
 
 // One key per alert: a new question or a new idle period is a new alert.
-const alertKey = (p: Peer) => (p.waiting !== null ? `${p.id}@wait@${p.waiting.id}` : `${p.id}@cold@${p.lastTurnAt}`)
+const alertKey = (p: Pick<Peer, 'id' | 'waiting' | 'lastTurnAt'>) =>
+  p.waiting !== null ? `${p.id}@wait@${p.waiting.id}` : `${p.id}@cold@${p.lastTurnAt}`
+
+const unmarkHandled = async ($: EngineInterface, key: string) => {
+  await $.process.run(['rm', '-f', '--', `${await handledDir($)}/${key}`], { timeoutMs: 5000 }).catch(() => undefined)
+}
+
+// Pasted blocks arrive as <pasted_content id="..."> tags: a name made of them names nothing.
+const nameOf = (text: string) => oneLine(text.replace(/<[^>]*>/g, ' '), 40)
+
+const TITLE_PATTERN = '"customTitle":"([^"\\\\]|\\\\.)*"'
+
+// Found once per load: ~/.claude/projects/<folder>/<session id>.jsonl.
+let transcriptPath: string | null = null
+
+const readTitle = async ($: EngineInterface) => {
+  if (transcriptPath === null) {
+    const [root, id] = [`${await home($)}/.claude/projects`, await $.session.id()]
+    const found = await $.process
+      .run(['find', root, '-maxdepth', '2', '-name', `${id}.jsonl`], { timeoutMs: 5000 })
+      .catch(() => null)
+    transcriptPath = found?.stdout.trim().split('\n')[0] || null
+  }
+  if (!transcriptPath) return
+  const ran = await $.process
+    .run(['grep', '-a', '-o', '-E', TITLE_PATTERN, transcriptPath], { timeoutMs: 5000 })
+    .catch(() => null)
+  const last = ran?.exitCode === 0 ? ran.stdout.trim().split('\n').pop() : undefined
+  if (!last) return
+  try {
+    const found = (JSON.parse(`{${last}}`) as { customTitle?: unknown }).customTitle
+    if (typeof found === 'string' && found.trim()) await update($, title, () => oneLine(found, 60))
+  } catch {
+    // A line cut mid-write: the next read gets it whole.
+  }
+}
 
 // Writes a command into the peer's inbox; the peer runs it within one poll.
-const sendCommand = async ($: EngineInterface, peer: Peer, verb: Command['verb']) => {
+const sendCommand = async ($: EngineInterface, peer: Peer, verb: Command['verb'], answers?: Record<string, string>) => {
   const key = alertKey(peer)
   await update($, hiddenAlerts, keys => [...keys.filter(k => k !== key), key].slice(-50))
-  const [dir, from, at] = await Promise.all([inboxDir($, peer.id), $.session.id(), $.clock.now()])
-  const command: Command = { id: `${at}-${verb}`, verb, waitId: peer.waiting?.id ?? null, from, at }
+  const [dir, handled, from, at] = await Promise.all([inboxDir($, peer.id), handledDir($), $.session.id(), $.clock.now()])
+  const command: Command = { id: `${at}-${verb}`, verb, waitId: peer.waiting?.id ?? null, from, at, answers }
   const path = `${dir}/${command.id}.json`
   const name = oneLine(peer.label, NAME_MAX)
   try {
-    await $.process.run(['mkdir', '-p', dir], { timeoutMs: 5000 })
+    await $.process.run(['mkdir', '-p', dir, handled], { timeoutMs: 5000 })
     await $.fs.write(path, JSON.stringify(command))
+    await $.fs.write(`${handled}/${key}`, '')
   } catch (err) {
+    await unmarkHandled($, key)
     await update($, hiddenAlerts, keys => keys.filter(k => k !== key))
     $.ui.toast(`${VERB_TEXT[verb]} → ${name} failed: ${oneLine(String(err), 80)}`, { timeoutMs: 8000 })
     return
@@ -209,6 +263,7 @@ const sendCommand = async ($: EngineInterface, peer: Peer, verb: Command['verb']
   $.clock.after(INBOX_STALE_MS, async () => {
     if (!(await $.fs.exists(path))) return
     await $.process.run(['rm', '-f', '--', path], { timeoutMs: 5000 }).catch(() => undefined)
+    await unmarkHandled($, key)
     await update($, hiddenAlerts, keys => keys.filter(k => k !== key))
     await say($, `${VERB_TEXT[verb]} → ${name}: not picked up`, 'error')
     $.ui.toast(`${name} did not pick up ${VERB_TEXT[verb]}`, { timeoutMs: 8000 })
@@ -241,10 +296,12 @@ const pollInbox = async ($: EngineInterface) => {
     } else {
       const settle = command.waitId === null ? undefined : remoteAnswers.get(command.waitId)
       if (settle === undefined) {
+        // The question may still be open (asked before a reload): show its alert again everywhere.
+        if (command.waitId !== null) await unmarkHandled($, `${await $.session.id()}@wait@${command.waitId}`)
         await say($, `${VERB_TEXT[command.verb]} from another session: nothing waiting`, 'warning')
         continue
       }
-      settle(command.verb)
+      settle(command)
     }
   }
 }
@@ -255,16 +312,16 @@ const waitForPerson = async <R,>(
   $: EngineInterface,
   id: string,
   local: Promise<R>,
-  answer: (verb: 'accept' | 'decline') => R | null,
+  answer: (command: Command) => R | null,
 ): Promise<R> => {
   local.catch(() => undefined)
-  const remote = new Promise<'accept' | 'decline'>(resolve => remoteAnswers.set(id, resolve))
+  const remote = new Promise<Command>(resolve => remoteAnswers.set(id, resolve))
   try {
-    const won = await Promise.race([local.then(r => ({ r })), remote.then(verb => ({ verb }))])
+    const won = await Promise.race([local.then(r => ({ r })), remote.then(command => ({ command }))])
     if ('r' in won) return won.r
-    const answered = answer(won.verb)
+    const answered = answer(won.command)
     if (answered === null) return await local // a verb this tool takes no answer for
-    await say($, `${VERB_TEXT[won.verb]} from another session`, 'success')
+    await say($, `${VERB_TEXT[won.command.verb]} from another session`, 'success')
     return answered
   } finally {
     remoteAnswers.delete(id)
@@ -272,6 +329,38 @@ const waitForPerson = async <R,>(
 }
 
 const openDeck = ($: EngineInterface) => $.ui.open({ id: PANE, title: 'Session deck' })
+
+// Workspace first, then the session's name; a session named after its folder shows once.
+const whereOf = (p: Peer, max = 200) => (p.label === p.dir ? p.dir : `${p.dir} · ${oneLine(p.label, max)}`)
+
+const detailOf = (p: Peer) =>
+  p.waiting !== null
+    ? p.waiting.summary || p.waiting.tool
+    : p.coldInMs === null
+      ? 'prompt cache going cold'
+      : `prompt cache cold in ${span(Math.max(0, p.coldInMs))}`
+
+// The presses that act in the peer: none where it does not poll an inbox.
+const verbsOf = (p: Peer): Command['verb'][] =>
+  !p.hasControls
+    ? []
+    : p.waiting === null
+      ? ['save-brain', 'compact']
+      : p.waiting.tool === 'ExitPlanMode'
+        ? ['decline']
+        : ['accept', 'decline']
+
+const openAlert = async ($: EngineInterface, p: Peer) => {
+  await update($, alertPeer, () => p.id)
+  await update($, choices, () => ({}))
+  await $.ui.open({ id: ALERT_PANE, title: oneLine(whereOf(p), 60), closeOnEscape: true })
+}
+
+// A press in the alert pane acts in the peer, then the pane closes.
+const sendFromPane = async ($: EngineInterface, p: Peer, verb: Command['verb'], answers?: Record<string, string>) => {
+  await sendCommand($, p, verb, answers)
+  await $.ui.close({ id: ALERT_PANE })
+}
 
 const refresh = async ($: EngineInterface) => {
   const [usage, cwd, now, prompts, isGoalMode] = await Promise.all([
@@ -341,20 +430,22 @@ const rowOf = (b: Beat, isSelf: boolean, now: number): SessionRow => {
 // Writes this session's heartbeat and reads every other live session's, so each session can
 // remind about the others' prompt caches and questions.
 const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
-  const [dir, id, cwd, now, turn, working, name, waits] = await Promise.all([
+  const [dir, handled, id, cwd, now, turn, working, name, appTitle, waits] = await Promise.all([
     beatsDir($),
+    handledDir($),
     $.session.id(),
     $.session.cwd(),
     $.clock.now(),
     read($, lastTurn),
     read($, isWorking),
     read($, label),
+    read($, title),
     read($, pending),
   ])
   const folder = cwd.split('/').pop() || cwd
   const beat: Beat = {
     id,
-    label: name ?? folder,
+    label: appTitle ?? ((name === null ? '' : nameOf(name)) || folder),
     dir: folder,
     at: now,
     lastTurnAt: turn?.at ?? null,
@@ -369,6 +460,7 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
     return
   }
 
+  const isHandled = new Set((await $.fs.list(handled).catch(() => [])).map(entry => entry.name))
   const found: Peer[] = []
   const rows: SessionRow[] = [rowOf(beat, true, now)]
   for (const entry of await $.fs.list(dir).catch(() => [])) {
@@ -384,12 +476,10 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
     rows.push(row)
     const waiting = other.waiting ?? null
     const hasControls = (other.controls ?? 0) >= CONTROLS
-    const name = oneLine(other.label, NAME_MAX)
+    // The band row is the alert. No toast: every live session would raise its own.
+    if (isHandled.has(alertKey({ id: other.id, waiting, lastTurnAt: other.lastTurnAt }))) continue
     if (waiting !== null) {
       found.push({ id: other.id, label: other.label, dir: other.dir, lastTurnAt: other.lastTurnAt, coldInMs: null, waiting, hasControls })
-      if (await markWarned($, `wait@${other.id}@${waiting.id}`)) {
-        $.ui.toast(`🔔 ${name}`, { timeoutMs: 60_000 })
-      }
       continue
     }
     if (row.state !== 'idle' || row.coldInMs === null || row.coldInMs > leadMs) continue
@@ -402,17 +492,28 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
       waiting: null,
       hasControls,
     })
-    if (await markWarned($, `peer@${other.id}@${other.lastTurnAt}`)) {
-      $.ui.toast(`⏳ ${name}`, { timeoutMs: 30_000 })
-    }
   }
   await update($, peers, () => found)
   await update($, sessions, () => rows)
 }
 
+// AskUserQuestion's questions with their option labels; anything else has none.
+const questionsOf = (input: unknown): Question[] | undefined => {
+  const raw = (input ?? {}) as { questions?: unknown }
+  if (!Array.isArray(raw.questions)) return undefined
+  return raw.questions.map((q: { question?: unknown; header?: unknown; options?: unknown; multiSelect?: unknown }) => ({
+    question: String(q.question ?? ''),
+    header: String(q.header ?? ''),
+    options: Array.isArray(q.options) ? q.options.map((o: { label?: unknown }) => String(o?.label ?? '')) : [],
+    multiSelect: q.multiSelect === true,
+  }))
+}
+
 const addPending = async ($: EngineInterface, id: string, tool: string, input: unknown, ttlMs: number, leadMs: number) => {
   const since = await $.clock.now()
-  await update($, pending, list => [...list.filter(w => w.id !== id), { id, tool, summary: summarize(input), since }])
+  // A question in the first turn comes before turn.complete reads the title.
+  await readTitle($)
+  await update($, pending, list => [...list.filter(w => w.id !== id), { id, tool, summary: summarize(input), since, questions: questionsOf(input) }])
   await say($, `waiting for you: ${tool}`, 'warning')
   await syncPeers($, ttlMs, leadMs)
 }
@@ -477,6 +578,10 @@ export const register: Register = (on, options) => {
     await $.process
       .run(['find', dir, '-name', '*.json', '-mmin', '+1440', '-delete'], { timeoutMs: 5000 })
       .catch(() => undefined)
+    await $.process
+      .run(['find', await handledDir($), '-type', 'f', '-mmin', '+1440', '-delete'], { timeoutMs: 5000 })
+      .catch(() => undefined)
+    await readTitle($)
     await $.process.run(['mkdir', '-p', await inboxDir($, await $.session.id())], { timeoutMs: 5000 }).catch(() => undefined)
     await tick($, ttlMs, leadMs)
     $.clock.every(TICK_MS, () => void tick($, ttlMs, leadMs))
@@ -572,6 +677,7 @@ export const register: Register = (on, options) => {
       const [usage, startCost] = await Promise.all([$.session.usage(), read($, turnCostStart)])
       const costNow = usage.cost?.usd ?? null
       await update($, isWorking, () => false)
+      await readTitle($)
       await clearPending($, null, ttlMs, leadMs)
       await update($, lastTurn, () => ({
         at,
@@ -601,8 +707,13 @@ export const register: Register = (on, options) => {
     if (await isGoalModeOn($)) return { deny: ASK_DENY }
     await addPending($, e.tool_use_id, e.tool, e, ttlMs, leadMs)
     try {
-      return await waitForPerson($, e.tool_use_id, next(e), verb => ({
-        deny: verb === 'accept' ? ACCEPT_ANSWER : DECLINE_ANSWER.AskUserQuestion,
+      return await waitForPerson($, e.tool_use_id, next(e), command => ({
+        deny:
+          command.verb === 'answer' && command.answers
+            ? answerText(command.answers)
+            : command.verb === 'accept'
+              ? ACCEPT_ANSWER
+              : DECLINE_ANSWER.AskUserQuestion,
       }))
     } finally {
       await clearPending($, e.tool_use_id, ttlMs, leadMs)
@@ -613,8 +724,8 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'ExitPlanMode' }, async ($, e, next) => {
     await addPending($, e.tool_use_id, e.tool, e, ttlMs, leadMs)
     try {
-      return await waitForPerson($, e.tool_use_id, next(e), verb =>
-        verb === 'decline' ? { deny: DECLINE_ANSWER.ExitPlanMode } : null,
+      return await waitForPerson($, e.tool_use_id, next(e), command =>
+        command.verb === 'decline' ? { deny: DECLINE_ANSWER.ExitPlanMode } : null,
       )
     } finally {
       await clearPending($, e.tool_use_id, ttlMs, leadMs)
@@ -666,40 +777,38 @@ export const register: Register = (on, options) => {
     const running = cards.filter(c => c.status === 'running').length
 
     // One row per peer that needs the person: its name, and the presses that act in that session.
+    // Hovering the row shows the full name and what it waits on; Open shows the whole question.
     const alert = (p: Peer) => {
       const isWaiting = p.waiting !== null
-      const verbs: Command['verb'][] = !p.hasControls
-        ? []
-        : isWaiting
-          ? p.waiting?.tool === 'ExitPlanMode'
-            ? ['decline']
-            : ['accept', 'decline']
-          : ['save-brain', 'compact']
       return (
         <Box
           key={`peer-${p.id}`}
-          flexDirection="row"
-          alignItems="center"
+          flexDirection="column"
           width="100%"
           backgroundColor={isWaiting ? TINT.error : TINT.warning}
           paddingX={1}
-          columnGap={1}
         >
-          {/* minWidth 0: a flex child is otherwise as wide as its text, so the cut never happens. */}
-          <Box flexShrink={1} flexGrow={1} minWidth={0}>
-            <Text color={isWaiting ? 'error' : 'warning'} wrap="truncate-end">
-              {`${isWaiting ? '🔔' : '⏳'} ${oneLine(p.label, NAME_MAX)}`}
-            </Text>
+          <Box flexDirection="row" alignItems="center" width="100%" columnGap={1}>
+            {/* minWidth 0: a flex child is otherwise as wide as its text, so the cut never happens. */}
+            <Box flexShrink={1} flexGrow={1} minWidth={0}>
+              <Text color={isWaiting ? 'error' : 'warning'} wrap="truncate-end">
+                {`${isWaiting ? '🔔' : '⏳'} ${whereOf(p, NAME_MAX)}`}
+              </Text>
+            </Box>
+            <Button key={`open-${p.id}`} label="Open" dimColor onPress={() => openAlert($, p)} />
+            {verbsOf(p).map(verb => (
+              <Button
+                key={`${verb}-${p.id}`}
+                label={VERB_TEXT[verb]}
+                variant={verb === 'accept' ? 'primary' : undefined}
+                dimColor={verb !== 'accept'}
+                onPress={() => sendCommand($, p, verb)}
+              />
+            ))}
           </Box>
-          {verbs.map(verb => (
-            <Button
-              key={`${verb}-${p.id}`}
-              label={VERB_TEXT[verb]}
-              variant={verb === 'accept' ? 'primary' : undefined}
-              dimColor={verb !== 'accept'}
-              onPress={() => sendCommand($, p, verb)}
-            />
-          ))}
+          <Box display="none" hover={{ display: 'flex' }}>
+            <Text color={isWaiting ? 'error' : 'warning'} dimColor>{`${whereOf(p)} — ${detailOf(p)}`}</Text>
+          </Box>
         </Box>
       )
     }
@@ -786,6 +895,78 @@ export const register: Register = (on, options) => {
           )}
         </Box>
         {others.map(alert)}
+      </Box>
+    )
+  })
+
+  // ---------------------------------------------------------------- alert pane
+
+  on('ui.render', { component: 'Pane', requestId: ALERT_PANE }, async ($, e) => {
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const [peerId, list, picked] = await Promise.all([read($, alertPeer), read($, peers), read($, choices)])
+    const p = list.find(x => x.id === peerId)
+    if (p === undefined) {
+      return (
+        <Box flexDirection="column" paddingX={1}>
+          <Text dimColor>That session no longer needs you.</Text>
+        </Box>
+      )
+    }
+    const questions = p.waiting?.questions ?? []
+    const canAct = p.hasControls
+    // One single-choice question: an option press is the whole answer.
+    const isOneShot = questions.length === 1 && questions[0]?.multiSelect === false
+    const isComplete = questions.length > 0 && questions.every(q => (picked[q.question] ?? []).length > 0)
+    const pick = async (q: Question, label: string) => {
+      if (isOneShot) return sendFromPane($, p, 'answer', { [q.question]: label })
+      await update($, choices, c => {
+        const had = c[q.question] ?? []
+        const now = q.multiSelect ? (had.includes(label) ? had.filter(x => x !== label) : [...had, label]) : [label]
+        return { ...c, [q.question]: now }
+      })
+    }
+    const answers = () => Object.fromEntries(questions.map(q => [q.question, (picked[q.question] ?? []).join(', ')]))
+
+    return (
+      <Box flexDirection="column" paddingX={1} rowGap={1}>
+        <Text weight="semibold">{whereOf(p)}</Text>
+        <Text dimColor>{p.waiting === null ? detailOf(p) : `${p.waiting.tool} · waiting ${span(Math.max(0, (await $.clock.now()) - p.waiting.since))}`}</Text>
+        {questions.length === 0 && p.waiting !== null && <Text>{p.waiting.summary}</Text>}
+        {questions.map((q, qi) => (
+          <Box key={`q-${qi}`} flexDirection="column" rowGap={0}>
+            {q.header !== '' && <Text size="caption" dimColor>{q.multiSelect ? `${q.header} · several` : q.header}</Text>}
+            <Text>{q.question}</Text>
+            {canAct && (
+              <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={1}>
+                {q.options.map((label, oi) => (
+                  <Button
+                    key={`opt-${qi}-${oi}`}
+                    label={label}
+                    variant={(picked[q.question] ?? []).includes(label) ? 'primary' : undefined}
+                    onPress={() => pick(q, label)}
+                  />
+                ))}
+              </Box>
+            )}
+          </Box>
+        ))}
+        {canAct ? (
+          <Box flexDirection="row" columnGap={1}>
+            {!isOneShot && isComplete && (
+              <Button key="send" label="Send answers" variant="primary" onPress={() => sendFromPane($, p, 'answer', answers())} />
+            )}
+            {verbsOf(p).map(verb => (
+              <Button
+                key={verb}
+                label={verb === 'accept' ? 'Accept (recommended)' : VERB_TEXT[verb]}
+                dimColor={verb !== 'accept'}
+                onPress={() => sendFromPane($, p, verb)}
+              />
+            ))}
+          </Box>
+        ) : (
+          <Text dimColor>That session runs an older session-band: answer it there.</Text>
+        )}
       </Box>
     )
   })
