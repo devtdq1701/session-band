@@ -1,0 +1,5 @@
+{
+  "name": "session-band",
+  "owner": { "name": "devtdq1701" },
+  "plugins": [{ "name": "session-band", "source": "./" }]
+}
