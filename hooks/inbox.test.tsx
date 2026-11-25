@@ -11,7 +11,8 @@ const beat = (id: string, label: string, lastTurnAt: number | null, waiting: unk
 
 // Stands in for the engine beneath the mod: a session "me" with no git, no flag file and an
 // inbox that holds `files` until the mod removes them.
-const engine = (on: On, files: Map<string, string>, ran: string[], toasts: string[] = []) => {
+const engine = (on: On, files: Map<string, string>, ran: string[], toasts: string[] = [], paneLog: string[] = []) => {
+  const panes = new Set<string>()
   const clock = mock.clock(on)
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/h' : undefined }))
   on('session.id', () => ({ value: 'me' }))
@@ -58,8 +59,19 @@ const engine = (on: On, files: Map<string, string>, ran: string[], toasts: strin
     return { text: e.text }
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('ui.close', () => ({ value: undefined }))
+  on('ui.open', (_, e) => {
+    panes.add(e.id)
+    paneLog.push(`open:${e.id}`)
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', (_, e) => {
+    panes.delete(e.id)
+    paneLog.push(`close:${e.id}`)
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({
+    value: [...panes].map((id, i, all) => ({ id, title: id, isShown: i === all.length - 1, isFocused: false, isPlaced: true })),
+  }))
   on('ui.toast', (_, e) => {
     toasts.push(e.text)
     return { value: undefined }
@@ -192,8 +204,10 @@ test('a peer waiting or going cold shows on the band only, with no toast', async
   expect(await ui.find({ type: 'Button', key: 'compact-peer1' })).toBeDefined()
   expect(toasts.filter(t => t.includes('Peer'))).toEqual([])
   // Workspace first, then the session's name.
-  expect(await ui.find({ type: 'Text', text: /⏳ p · Peer one/ })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: /🔔 p · Peer two/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Peer one$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Peer two$/ })).toBeDefined()
+  expect(await ui.find({ key: 'chip-peer1' })).toBeDefined()
+  expect(await ui.find({ key: 'chip-peer2' })).toBeDefined()
   await ui.unmount()
 })
 
@@ -221,7 +235,7 @@ test('an Accept that finds nothing waiting brings the alert back for every sessi
   expect(files.has(`${HANDLED}/me@wait@w1`)).toBe(false)
 })
 
-const COLOUR = { question: 'Which colour?', header: 'Colour', options: ['Red', 'Blue'], multiSelect: false }
+const COLOUR = { question: 'Which colour?', header: 'Colour', options: ['Red', 'Blue'], multiSelect: false, descriptions: ['', ''] }
 const ASKING = { id: 'w1', tool: 'AskUserQuestion', summary: 'Which colour?', since: 0, questions: [COLOUR] }
 const ALERT_PANE = {
   plugin: 'session-band',
@@ -238,7 +252,7 @@ test('hovering an alert reveals the full name and the question', async ($, on) =
   await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
 
   const ui = await $.ui.mount({ plugin: 'session-band', component: 'AbovePrompt', surface: 'desktop', props: BAND_PROPS })
-  expect(await ui.find({ type: 'Text', text: /p · Peer two — Which colour\?/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Which colour\?$/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -288,4 +302,60 @@ test('an answer pressed in another session settles the question with that option
 
   const answered = await asked
   expect(answered.deny).toMatch(/"Which colour\?" → "Blue"/)
+})
+
+test('Deck opens the deck, and a second press closes it', async ($, on) => {
+  const files = new Map<string, string>()
+  const paneLog: string[] = []
+  engine(on, files, [], [], paneLog)
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+
+  const band = await $.ui.mount({ plugin: 'session-band', component: 'AbovePrompt', surface: 'desktop', props: BAND_PROPS })
+  await band.press({ key: 'deck' })
+  await band.press({ key: 'deck' })
+  expect(paneLog).toEqual(['open:session-deck', 'close:session-deck'])
+  await band.unmount()
+})
+
+test("Details opens an alert's pane, a second press closes it, another alert's press switches it", async ($, on) => {
+  const files = new Map<string, string>()
+  const paneLog: string[] = []
+  engine(on, files, [], [], paneLog)
+  files.set(`${BEATS}/peer1.json`, beat('peer1', 'Peer one', -55 * 60_000))
+  files.set(`${BEATS}/peer2.json`, beat('peer2', 'Peer two', null, ASKING))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+
+  const band = await $.ui.mount({ plugin: 'session-band', component: 'AbovePrompt', surface: 'desktop', props: BAND_PROPS })
+  await band.press({ key: 'open-peer1' })
+  await band.press({ key: 'open-peer2' })
+  const pane = await $.ui.mount(ALERT_PANE)
+  expect(await pane.find({ type: 'Text', text: /Which colour\?/ })).toBeDefined()
+  await band.press({ key: 'open-peer2' })
+  expect(paneLog).toEqual(['open:session-alert', 'open:session-alert', 'close:session-alert'])
+  await pane.unmount()
+  await band.unmount()
+})
+
+test('Send answers pressed before every question has a pick says which one is missing', async ($, on) => {
+  const files = new Map<string, string>()
+  engine(on, files, [])
+  const second = { question: 'Which size?', header: 'Size', options: ['S', 'L'], multiSelect: false }
+  files.set(`${BEATS}/peer2.json`, beat('peer2', 'Peer two', null, { ...ASKING, questions: [COLOUR, second] }))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+
+  const band = await $.ui.mount({ plugin: 'session-band', component: 'AbovePrompt', surface: 'desktop', props: BAND_PROPS })
+  await band.press({ key: 'open-peer2' })
+  const pane = await $.ui.mount(ALERT_PANE)
+  await pane.press({ key: 'opt-0-1' })
+  await pane.press({ key: 'send' })
+  expect(await pane.find({ key: 'missing-1' })).toBeDefined()
+  expect(await pane.find({ key: 'missing-0' })).toBeUndefined()
+  expect([...files.keys()].some(k => k.startsWith('/h/.claude/session-band/inbox/peer2/'))).toBe(false)
+
+  await pane.press({ key: 'opt-1-0' })
+  await pane.press({ key: 'send' })
+  const sent = [...files.entries()].find(([k]) => k.startsWith('/h/.claude/session-band/inbox/peer2/'))
+  expect(JSON.parse(sent?.[1] ?? '{}').answers).toEqual({ 'Which colour?': 'Blue', 'Which size?': 'S' })
+  await pane.unmount()
+  await band.unmount()
 })

@@ -26,6 +26,8 @@ const saveBrainSentAt = atom({ plugin: 'session-band', key: 'saveBrainSentAt' } 
 // The peer the alert pane shows, and the options picked there so far by question text.
 const alertPeer = atom({ plugin: 'session-band', key: 'alertPeer' } as const, null)
 const choices = atom({ plugin: 'session-band', key: 'choices' } as const, {})
+// Send answers was pressed with a question unpicked: the pane says which.
+const alertTried = atom({ plugin: 'session-band', key: 'alertTried' } as const, false)
 
 const PANE = 'session-deck'
 const ALERT_PANE = 'session-alert'
@@ -330,15 +332,42 @@ const waitForPerson = async <R,>(
 
 const openDeck = ($: EngineInterface) => $.ui.open({ id: PANE, title: 'Session deck' })
 
+// The engine's record, so a pane left up across a reload still counts.
+const isShown = async ($: EngineInterface, id: string) =>
+  (await $.ui.panes().catch(() => [])).some(pane => pane.id === id && pane.isShown)
+
+// The band's Deck: a press opens it, a press while it is shown closes it.
+const toggleDeck = async ($: EngineInterface) => {
+  if (await isShown($, PANE)) await $.ui.close({ id: PANE })
+  else await openDeck($)
+}
+
 // Workspace first, then the session's name; a session named after its folder shows once.
 const whereOf = (p: Peer, max = 200) => (p.label === p.dir ? p.dir : `${p.dir} · ${oneLine(p.label, max)}`)
 
-const detailOf = (p: Peer) =>
+// The status chip: why the peer is here and for how long, in the header pills' language.
+const chipOf = (p: Peer, now: number): Pill =>
   p.waiting !== null
-    ? p.waiting.summary || p.waiting.tool
-    : p.coldInMs === null
-      ? 'prompt cache going cold'
-      : `prompt cache cold in ${span(Math.max(0, p.coldInMs))}`
+    ? {
+        label: p.waiting.tool === 'ExitPlanMode' ? 'plan' : 'asks',
+        icon: 'bell',
+        value: span(Math.max(0, now - p.waiting.since)),
+        detail: '',
+        accent: 'red',
+      }
+    : { label: 'cold in', icon: 'clock', value: span(Math.max(0, p.coldInMs ?? 0)), detail: '', accent: 'amber' }
+
+// What hovering the row adds: what the row cannot fit, never what it already shows.
+const revealOf = (p: Peer, now: number) => {
+  const fullName = p.label.length > NAME_MAX ? `${p.label}. ` : ''
+  if (p.waiting !== null) {
+    const first = p.waiting.questions?.[0]
+    const more = (p.waiting.questions?.length ?? 0) > 1 ? ` (+${(p.waiting.questions?.length ?? 1) - 1} more)` : ''
+    return `${fullName}${first?.question ?? p.waiting.summary}${more}`
+  }
+  const coldAt = now + (p.coldInMs ?? 0)
+  return `${fullName}Idle since ${clock(p.lastTurnAt ?? now)}, cache cold at ${clock(coldAt)}. Save-brain writes a handoff; Compact shrinks the context.`
+}
 
 // The presses that act in the peer: none where it does not poll an inbox.
 const verbsOf = (p: Peer): Command['verb'][] =>
@@ -350,9 +379,16 @@ const verbsOf = (p: Peer): Command['verb'][] =>
         ? ['decline']
         : ['accept', 'decline']
 
+// Answer… / Details: opens the pane on this alert, closes it when it already shows this alert,
+// switches it when it shows another.
 const openAlert = async ($: EngineInterface, p: Peer) => {
+  if ((await read($, alertPeer)) === p.id && (await isShown($, ALERT_PANE))) {
+    await $.ui.close({ id: ALERT_PANE })
+    return
+  }
   await update($, alertPeer, () => p.id)
   await update($, choices, () => ({}))
+  await update($, alertTried, () => false)
   await $.ui.open({ id: ALERT_PANE, title: oneLine(whereOf(p), 60), closeOnEscape: true })
 }
 
@@ -505,6 +541,9 @@ const questionsOf = (input: unknown): Question[] | undefined => {
     question: String(q.question ?? ''),
     header: String(q.header ?? ''),
     options: Array.isArray(q.options) ? q.options.map((o: { label?: unknown }) => String(o?.label ?? '')) : [],
+    descriptions: Array.isArray(q.options)
+      ? q.options.map((o: { description?: unknown }) => String(o?.description ?? ''))
+      : [],
     multiSelect: q.multiSelect === true,
   }))
 }
@@ -776,38 +815,34 @@ export const register: Register = (on, options) => {
     }
     const running = cards.filter(c => c.status === 'running').length
 
-    // One row per peer that needs the person: its name, and the presses that act in that session.
-    // Hovering the row shows the full name and what it waits on; Open shows the whole question.
+    // One row per peer that needs the person: a chip saying why and since when, the workspace and
+    // session, and the presses that act there. Hover adds what the row cannot fit; the last button
+    // opens the whole question (or what the cold-cache presses do) in a pane.
     const alert = (p: Peer) => {
       const isWaiting = p.waiting !== null
+      const chip = chipOf(p, now)
       return (
-        <Box
-          key={`peer-${p.id}`}
-          flexDirection="column"
-          width="100%"
-          backgroundColor={isWaiting ? TINT.error : TINT.warning}
-          paddingX={1}
-        >
+        <Box key={`peer-${p.id}`} flexDirection="column" width="100%" backgroundColor={isWaiting ? TINT.error : TINT.warning} paddingX={1}>
           <Box flexDirection="row" alignItems="center" width="100%" columnGap={1}>
+            {draw(`chip-${p.id}`, pillOf(chip, palette), `${chip.label} ${chip.value}`)}
             {/* minWidth 0: a flex child is otherwise as wide as its text, so the cut never happens. */}
-            <Box flexShrink={1} flexGrow={1} minWidth={0}>
-              <Text color={isWaiting ? 'error' : 'warning'} wrap="truncate-end">
-                {`${isWaiting ? '🔔' : '⏳'} ${whereOf(p, NAME_MAX)}`}
-              </Text>
+            <Box flexDirection="row" flexShrink={1} flexGrow={1} minWidth={0} columnGap={1}>
+              <Text weight="semibold" wrap="truncate-end">{p.dir}</Text>
+              {p.label !== p.dir && <Text wrap="truncate-end">{oneLine(p.label, NAME_MAX)}</Text>}
             </Box>
-            <Button key={`open-${p.id}`} label="Open" dimColor onPress={() => openAlert($, p)} />
             {verbsOf(p).map(verb => (
               <Button
                 key={`${verb}-${p.id}`}
                 label={VERB_TEXT[verb]}
-                variant={verb === 'accept' ? 'primary' : undefined}
-                dimColor={verb !== 'accept'}
+                variant={verb === 'accept' || verb === 'save-brain' ? 'primary' : undefined}
+                dimColor={!(verb === 'accept' || verb === 'save-brain')}
                 onPress={() => sendCommand($, p, verb)}
               />
             ))}
+            <Button key={`open-${p.id}`} label={isWaiting ? 'Answer…' : 'Details'} dimColor onPress={() => openAlert($, p)} />
           </Box>
-          <Box display="none" hover={{ display: 'flex' }}>
-            <Text color={isWaiting ? 'error' : 'warning'} dimColor>{`${whereOf(p)} — ${detailOf(p)}`}</Text>
+          <Box display="none" hover={{ display: 'flex' }} paddingBottom={0}>
+            <Text size="footnote" wrap="wrap">{revealOf(p, now)}</Text>
           </Box>
         </Box>
       )
@@ -873,7 +908,7 @@ export const register: Register = (on, options) => {
           <Box flexDirection="row" alignItems="center" flexShrink={0} columnGap={1} marginLeft={2}>
             {draw('totals', totalsMark(totals, palette), totals)}
             <Button key="save-brain" label="Save" dimColor onPress={() => void saveBrain($)} />
-            <Button key="deck" label="Deck" dimColor onPress={() => void openDeck($)} />
+            <Button key="deck" label="Deck" dimColor onPress={() => toggleDeck($)} />
             <Button
               key="goal-mode"
               label={snap.isGoalMode ? 'Goal off' : 'Goal'}
@@ -902,18 +937,28 @@ export const register: Register = (on, options) => {
   // ---------------------------------------------------------------- alert pane
 
   on('ui.render', { component: 'Pane', requestId: ALERT_PANE }, async ($, e) => {
-    const { Box, Button, Text } = $.ui.resolve(e)
-    const [peerId, list, picked] = await Promise.all([read($, alertPeer), read($, peers), read($, choices)])
+    const els = $.ui.resolve(e)
+    const { Box, Button, Text } = els
+    const Svg = 'Svg' in els ? els.Svg : null
+    const [peerId, list, picked, tried, now] = await Promise.all([
+      read($, alertPeer),
+      read($, peers),
+      read($, choices),
+      read($, alertTried),
+      $.clock.now(),
+    ])
     const p = list.find(x => x.id === peerId)
     if (p === undefined) {
       return (
-        <Box flexDirection="column" paddingX={1}>
-          <Text dimColor>That session no longer needs you.</Text>
+        <Box flexDirection="column" paddingX={1} paddingY={1}>
+          <Text dimColor>This session no longer needs you. Close the pane.</Text>
         </Box>
       )
     }
+    const palette = PALETTES[options.theme === 'dark' ? 'dark' : 'light']
+    const chip = chipOf(p, now)
+    const piece = pillOf(chip, palette)
     const questions = p.waiting?.questions ?? []
-    const canAct = p.hasControls
     // One single-choice question: an option press is the whole answer.
     const isOneShot = questions.length === 1 && questions[0]?.multiSelect === false
     const isComplete = questions.length > 0 && questions.every(q => (picked[q.question] ?? []).length > 0)
@@ -926,46 +971,89 @@ export const register: Register = (on, options) => {
       })
     }
     const answers = () => Object.fromEntries(questions.map(q => [q.question, (picked[q.question] ?? []).join(', ')]))
+    const since = p.waiting !== null ? `since ${clock(p.waiting.since)}` : `idle since ${clock(p.lastTurnAt ?? now)}`
 
     return (
-      <Box flexDirection="column" paddingX={1} rowGap={1}>
-        <Text weight="semibold">{whereOf(p)}</Text>
-        <Text dimColor>{p.waiting === null ? detailOf(p) : `${p.waiting.tool} · waiting ${span(Math.max(0, (await $.clock.now()) - p.waiting.since))}`}</Text>
-        {questions.length === 0 && p.waiting !== null && <Text>{p.waiting.summary}</Text>}
+      <Box flexDirection="column" paddingX={1} paddingY={1} rowGap={1}>
+        <Box flexDirection="row" alignItems="center" columnGap={1}>
+          {Svg !== null ? (
+            <Svg source={piece.svg} alt={`${chip.label} ${chip.value}`} width={piece.width} height={piece.height} />
+          ) : (
+            <Text color={p.waiting !== null ? 'error' : 'warning'}>{`${chip.label} ${chip.value}`}</Text>
+          )}
+          <Text size="footnote" dimColor>{since}</Text>
+        </Box>
+
+        {p.waiting === null && (
+          <Text>
+            {`The prompt cache of this session goes cold at ${clock(now + (p.coldInMs ?? 0))}. Save-brain writes a handoff so the next session can pick up; Compact shrinks the context so the next prompt costs less.`}
+          </Text>
+        )}
+        {p.waiting !== null && questions.length === 0 && <Text>{p.waiting.summary || p.waiting.tool}</Text>}
+
         {questions.map((q, qi) => (
-          <Box key={`q-${qi}`} flexDirection="column" rowGap={0}>
-            {q.header !== '' && <Text size="caption" dimColor>{q.multiSelect ? `${q.header} · several` : q.header}</Text>}
-            <Text>{q.question}</Text>
-            {canAct && (
-              <Box flexDirection="row" flexWrap="wrap" columnGap={1} rowGap={1}>
-                {q.options.map((label, oi) => (
-                  <Button
-                    key={`opt-${qi}-${oi}`}
-                    label={label}
-                    variant={(picked[q.question] ?? []).includes(label) ? 'primary' : undefined}
-                    onPress={() => pick(q, label)}
-                  />
-                ))}
+          <Box key={`q-${qi}`} flexDirection="column" rowGap={1} borderStyle="round" borderDimColor paddingX={1} paddingY={1}>
+            <Box flexDirection="column">
+              {q.header !== '' && <Text size="footnote" dimColor>{q.multiSelect ? `${q.header}, pick any` : q.header}</Text>}
+              <Text weight="semibold">{q.question}</Text>
+            </Box>
+            {tried && (picked[q.question] ?? []).length === 0 && (
+              <Box key={`missing-${qi}`}>
+                <Text color="warning">Pick an option here to send the answers.</Text>
+              </Box>
+            )}
+            {p.hasControls && (
+              <Box flexDirection="column" rowGap={1}>
+                {q.options.map((label, oi) => {
+                  const isPicked = (picked[q.question] ?? []).includes(label)
+                  const description = q.descriptions?.[oi] ?? ''
+                  return (
+                    <Box key={`row-${qi}-${oi}`} flexDirection="row" alignItems="center" columnGap={1}>
+                      <Box flexShrink={0}>
+                        <Button
+                          key={`opt-${qi}-${oi}`}
+                          label={isPicked ? `✓ ${label}` : label}
+                          variant={isPicked || /\(recommended\)/i.test(label) ? 'primary' : undefined}
+                          onPress={() => pick(q, label)}
+                        />
+                      </Box>
+                      {description !== '' && (
+                        <Box flexShrink={1} minWidth={0}>
+                          <Text size="footnote" dimColor wrap="wrap">{description}</Text>
+                        </Box>
+                      )}
+                    </Box>
+                  )
+                })}
               </Box>
             )}
           </Box>
         ))}
-        {canAct ? (
-          <Box flexDirection="row" columnGap={1}>
-            {!isOneShot && isComplete && (
-              <Button key="send" label="Send answers" variant="primary" onPress={() => sendFromPane($, p, 'answer', answers())} />
+
+        {p.hasControls ? (
+          <Box flexDirection="row" columnGap={1} flexWrap="wrap">
+            {!isOneShot && questions.length > 0 && (
+              <Button
+                key="send"
+                label="Send answers"
+                variant="primary"
+                onPress={() =>
+                  isComplete ? sendFromPane($, p, 'answer', answers()) : update($, alertTried, () => true).then(() => undefined)
+                }
+              />
             )}
             {verbsOf(p).map(verb => (
               <Button
                 key={verb}
-                label={verb === 'accept' ? 'Accept (recommended)' : VERB_TEXT[verb]}
-                dimColor={verb !== 'accept'}
+                label={verb === 'accept' ? 'Use recommended' : VERB_TEXT[verb]}
+                variant={verb === 'save-brain' ? 'primary' : undefined}
+                dimColor={verb !== 'save-brain'}
                 onPress={() => sendFromPane($, p, verb)}
               />
             ))}
           </Box>
         ) : (
-          <Text dimColor>That session runs an older session-band: answer it there.</Text>
+          <Text dimColor>This session runs an older session-band. Answer it in that session.</Text>
         )}
       </Box>
     )

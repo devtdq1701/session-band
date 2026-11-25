@@ -27,7 +27,14 @@ export type TurnStat = {
 }
 
 // One AskUserQuestion question as another session's pane draws it.
-export type Question = { question: string; header: string; options: string[]; multiSelect: boolean }
+export type Question = {
+  question: string
+  header: string
+  options: string[]
+  multiSelect: boolean
+  // Each option's description, by index; absent on older code.
+  descriptions?: string[]
+}
 
 // A call this session is waiting on the person for: a question or a plan.
 export type Waiting = {
@@ -122,6 +129,7 @@ declare module 'claude-code' {
       hiddenAlerts: string[]
       alertPeer: string | null
       choices: Record<string, string[]>
+      alertTried: boolean
     }
   }
 }

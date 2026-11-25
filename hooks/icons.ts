@@ -5,6 +5,7 @@ const PATHS = {
     '<circle cx="6" cy="5.5" r="2"/><circle cx="6" cy="18.5" r="2"/><circle cx="18" cy="8" r="2"/>' +
     '<path d="M6 7.5v9"/><path d="M18 10c0 4.5-6.5 3.5-11 7"/>',
   clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+  bell: '<path d="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>',
   gauge: '<path d="M4 16.5a8 8 0 1 1 16 0"/><path d="M12 16.5l4-5"/>',
   bolt: '<path d="M13 3L5 14h6l-1 7 8-11h-6z"/>',
   database:
