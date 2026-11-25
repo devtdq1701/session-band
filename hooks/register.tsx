@@ -23,6 +23,10 @@ const agents = atom({ plugin: 'session-band', key: 'agents' } as const, [])
 const log = atom({ plugin: 'session-band', key: 'log' } as const, [])
 const turnCostStart = atom({ plugin: 'session-band', key: 'turnCostStart' } as const, null)
 const saveBrainSentAt = atom({ plugin: 'session-band', key: 'saveBrainSentAt' } as const, null)
+// The running turn answers a save-brain prompt; savedTurnAt is the end of the last such turn.
+const isSaveTurn = atom({ plugin: 'session-band', key: 'isSaveTurn' } as const, false)
+const savedTurnAt = atom({ plugin: 'session-band', key: 'savedTurnAt' } as const, null)
+const SAVE_BRAIN_TEXT = /^\s*save-brain\b/i
 // The peer the alert pane shows, and the options picked there so far by question text.
 const alertPeer = atom({ plugin: 'session-band', key: 'alertPeer' } as const, null)
 const choices = atom({ plugin: 'session-band', key: 'choices' } as const, {})
@@ -466,7 +470,7 @@ const rowOf = (b: Beat, isSelf: boolean, now: number): SessionRow => {
 // Writes this session's heartbeat and reads every other live session's, so each session can
 // remind about the others' prompt caches and questions.
 const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
-  const [dir, handled, id, cwd, now, turn, working, name, appTitle, waits] = await Promise.all([
+  const [dir, handled, id, cwd, now, turn, working, name, appTitle, waits, savedAt] = await Promise.all([
     beatsDir($),
     handledDir($),
     $.session.id(),
@@ -477,6 +481,7 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
     read($, label),
     read($, title),
     read($, pending),
+    read($, savedTurnAt),
   ])
   const folder = cwd.split('/').pop() || cwd
   const beat: Beat = {
@@ -489,6 +494,7 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
     ttlMs,
     waiting: waits[0] ?? null,
     controls: CONTROLS,
+    isSaved: turn !== null && savedAt === turn.at,
   }
   try {
     await $.fs.write(`${dir}/${id}.json`, JSON.stringify(beat))
@@ -518,7 +524,7 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
       found.push({ id: other.id, label: other.label, dir: other.dir, lastTurnAt: other.lastTurnAt, coldInMs: null, waiting, hasControls })
       continue
     }
-    if (row.state !== 'idle' || row.coldInMs === null || row.coldInMs > leadMs) continue
+    if (row.state !== 'idle' || row.coldInMs === null || row.coldInMs > leadMs || other.isSaved === true) continue
     found.push({
       id: other.id,
       label: other.label,
@@ -566,8 +572,8 @@ const clearPending = async ($: EngineInterface, id: string | null, ttlMs: number
 
 // One reminder per idle period, only between main turns, in the window before the cache goes cold.
 const remindCache = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
-  const [turn, working, now] = await Promise.all([read($, lastTurn), read($, isWorking), $.clock.now()])
-  if (turn === null || working) return
+  const [turn, working, now, savedAt] = await Promise.all([read($, lastTurn), read($, isWorking), $.clock.now(), read($, savedTurnAt)])
+  if (turn === null || working || savedAt === turn.at) return
   const idleMs = now - turn.at
   if (idleMs < ttlMs - leadMs || idleMs >= ttlMs) return
   if (await markWarned($, `cache@${turn.at}`)) {
@@ -653,6 +659,7 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     await update($, isWorking, () => true)
+    await update($, isSaveTurn, () => SAVE_BRAIN_TEXT.test(e.text))
     if (e.origin.kind === 'composer') {
       const text = oneLine(e.text, 40)
       if (text && (await read($, label)) === null) await update($, label, () => text)
@@ -718,6 +725,8 @@ export const register: Register = (on, options) => {
       await update($, isWorking, () => false)
       await readTitle($)
       await clearPending($, null, ttlMs, leadMs)
+      const isSave = await read($, isSaveTurn)
+      await update($, savedTurnAt, () => (isSave ? at : null))
       await update($, lastTurn, () => ({
         at,
         durationMs: e.durationMs,
@@ -779,12 +788,13 @@ export const register: Register = (on, options) => {
     if (snap === null) return next(e)
 
     const { Box, Button, Svg, Text } = $.ui.resolve(e)
-    const [turn, allPeers, hidden, cards, now] = await Promise.all([
+    const [turn, allPeers, hidden, cards, now, savedAt] = await Promise.all([
       read($, lastTurn),
       read($, peers),
       read($, hiddenAlerts),
       read($, agents),
       $.clock.now(),
+      read($, savedTurnAt),
     ])
     const others = allPeers.filter(p => !hidden.includes(alertKey(p)))
 
@@ -796,7 +806,10 @@ export const register: Register = (on, options) => {
     if (turn !== null && turn.at >= snap.startedAt && !e.props.isWorking) {
       const idleMs = Math.max(0, now - turn.at)
       const hit = turn.cacheHit === null ? 'cache' : `cache ${turn.cacheHit}%`
-      if (idleMs >= ttlMs) {
+      if (savedAt === turn.at) {
+        // State saved by the last turn: nothing to remind about until the next prompt.
+        cacheText = `${hit} · saved${idleMs >= ttlMs ? ' · cold' : ''}`
+      } else if (idleMs >= ttlMs) {
         cacheText = `${hit} · cold`
         cacheTone = 'error'
         ownNote = 'This session\'s cache is cold'

@@ -59,6 +59,8 @@ export type Beat = {
   waiting?: Waiting | null
   // Inbox protocol this session polls (~/.claude/session-band/inbox/<id>/); absent on older code.
   controls?: number
+  // The last turn was a save-brain: its idle period needs no cold reminder. Absent on older code.
+  isSaved?: boolean
 }
 
 // One press in another session's band, written to this session's inbox and run here.
@@ -126,6 +128,8 @@ declare module 'claude-code' {
       log: LogLine[]
       turnCostStart: number | null
       saveBrainSentAt: number | null
+      isSaveTurn: boolean
+      savedTurnAt: number | null
       hiddenAlerts: string[]
       alertPeer: string | null
       choices: Record<string, string[]>

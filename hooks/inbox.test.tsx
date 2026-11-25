@@ -1,4 +1,4 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock, test, type Engine } from 'claude-code/testing'
 import type { EngineInterface, On } from 'claude-code'
 
 const INBOX = '/h/.claude/session-band/inbox/me'
@@ -358,4 +358,51 @@ test('Send answers pressed before every question has a pick says which one is mi
   expect(JSON.parse(sent?.[1] ?? '{}').answers).toEqual({ 'Which colour?': 'Blue', 'Which size?': 'S' })
   await pane.unmount()
   await band.unmount()
+})
+
+// A save-brain turn is itself a turn: it starts a new idle period. That period needs no
+// reminder, since the state was just saved, until a prompt of the person's starts a new one.
+const runTurn = async ($: Engine, text: string, origin: string) => {
+  await $.prompt.submit({ text, origin: { kind: origin } } as never)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1000 } as never)
+}
+
+test('a save-brain turn leaves its idle period without a cold reminder, here and on other bands', async ($, on) => {
+  const files = new Map<string, string>()
+  const toasts: string[] = []
+  const clock = engine(on, files, [], toasts)
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  await runTurn($, 'save-brain: save the session state now (save-state).', 'plugin')
+  await clock.advance(55 * 60_000)
+
+  expect(JSON.parse(files.get(`${BEATS}/me.json`) ?? '{}').isSaved).toBe(true)
+  expect(toasts.filter(t => t.includes('cold'))).toEqual([])
+  const ui = await $.ui.mount({ plugin: 'session-band', component: 'AbovePrompt', surface: 'desktop', props: BAND_PROPS })
+  expect(await ui.find({ type: 'Text', text: /cold in/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a prompt after save-brain brings the cold reminder back for its own idle period', async ($, on) => {
+  const files = new Map<string, string>()
+  const clock = engine(on, files, [])
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  await runTurn($, 'save-brain: save the session state now (save-state).', 'plugin')
+  await runTurn($, 'next task', 'composer')
+  await clock.advance(55 * 60_000)
+
+  expect(JSON.parse(files.get(`${BEATS}/me.json`) ?? '{}').isSaved).toBe(false)
+})
+
+test('a peer whose last turn saved its state raises no cold alert', async ($, on) => {
+  const files = new Map<string, string>()
+  const clock = engine(on, files, [])
+  files.set(`${BEATS}/peer1.json`, JSON.stringify({ ...JSON.parse(beat('peer1', 'Peer one', -55 * 60_000)), isSaved: true }))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(16_000)
+
+  const ui = await $.ui.mount({ plugin: 'session-band', component: 'AbovePrompt', surface: 'desktop', props: BAND_PROPS })
+  expect(await ui.find({ key: 'chip-peer1' })).toBeUndefined()
+  await ui.unmount()
 })
