@@ -44,19 +44,19 @@ const LOG_ROWS = 12
 const SHORT: Record<string, string> = { five_hour: '5h', seven_day: '7d' }
 const SAVE_BRAIN_PROMPT = 'save-brain: save the session state now (save-state).'
 const ACCEPT_ANSWER =
-  'Quang pressed Accept for this question from another session (session-band): go with your ' +
+  'The user pressed Accept for this question from another session (session-band): go with your ' +
   'recommended option for every question and carry on.'
 const DECLINE_ANSWER = {
   AskUserQuestion:
-    'Quang pressed Decline for this question from another session (session-band): take none of the ' +
-    'options, end your turn and wait for his next message.',
+    'The user pressed Decline for this question from another session (session-band): take none of the ' +
+    'options, end your turn and wait for their next message.',
   ExitPlanMode:
-    'Quang declined this plan from another session (session-band): stay in plan mode, end your turn ' +
-    'and wait for his feedback.',
+    'The user declined this plan from another session (session-band): stay in plan mode, end your turn ' +
+    'and wait for their feedback.',
 }
 const ASK_DENY =
-  'Goal mode is on (unattended.on): Quang is away, do not ask. Pick the recommended option, ' +
-  'mark it "(chốt hộ, Quang xem lại)" and carry on.'
+  'Goal mode is on (unattended.on): the user is away, do not ask. Pick the recommended option, ' +
+  'mark it as decided on their behalf for them to review, and carry on.'
 // Translucent tints read on light and dark themes alike.
 const TINT = { error: 'rgba(226,75,74,0.14)', warning: 'rgba(239,159,39,0.16)', tile: 'rgba(128,128,128,0.10)' }
 const LANE_COLOR: Record<AgentCard['status'], string> = {
