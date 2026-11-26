@@ -223,6 +223,35 @@ test('the heartbeat names the session by its title in the app', async ($, on) =>
   expect(JSON.parse(files.get(`${BEATS}/me.json`) ?? '{}').label).toBe('Autodeploy "v5"')
 })
 
+test('a side chat writes no heartbeat, and side chats on other bands are not listed', async ($, on) => {
+  const files = new Map<string, string>()
+  const clock = engine(on, files, [])
+  files.set(
+    '/h/.claude/projects/-w-proj/me.jsonl',
+    ['{"type":"custom-title","customTitle":"Parent work","sessionId":"parent"}', '{"type":"custom-title","customTitle":"Side chat","sessionId":"me"}'].join('\n'),
+  )
+  files.set(`${BEATS}/me.json`, beat('me', 'Parent work', 0))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(16_000)
+  expect(files.has(`${BEATS}/me.json`)).toBe(false)
+})
+
+test('a peer whose title marks a side chat is not listed or alerted', async ($, on) => {
+  const files = new Map<string, string>()
+  const clock = engine(on, files, [])
+  files.set(`${BEATS}/side1.json`, beat('side1', 'btw: what is X', -55 * 60_000))
+  files.set(`${BEATS}/side2.json`, beat('side2', 'Side chat', null, { id: 'w1', tool: 'AskUserQuestion', summary: 'q', since: 0 }))
+  files.set(`${BEATS}/peer1.json`, beat('peer1', 'Peer one', -55 * 60_000))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  await clock.advance(16_000)
+
+  const ui = await $.ui.mount({ plugin: 'session-band', component: 'AbovePrompt', surface: 'desktop', props: BAND_PROPS })
+  expect(await ui.find({ type: 'Button', key: 'compact-peer1' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'compact-side1' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'accept-side2' })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('an Accept that finds nothing waiting brings the alert back for every session', async ($, on) => {
   const files = new Map<string, string>()
   const clock = engine(on, files, [])

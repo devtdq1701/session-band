@@ -1,6 +1,6 @@
 {
   "name": "session-band",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Compact band above the Desktop prompt (context, 5h/7d limits, cache, cost, cross-session alerts), a Session deck pane (agent lanes, live sessions, log), cache-expiry reminders and a goal-mode toggle for the unattended auto-deny flag.",
   "types": "./types/index.d.ts",
   "userConfig": {

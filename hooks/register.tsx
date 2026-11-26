@@ -220,6 +220,11 @@ const nameOf = (text: string) => oneLine(text.replace(/<[^>]*>/g, ' '), 40)
 
 const TITLE_PATTERN = '"customTitle":"([^"\\\\]|\\\\.)*"'
 
+// A side chat (the desktop app's /btw) forks the transcript and titles itself "Side chat", then
+// "btw: <question>". It is part of its parent session, so it writes no heartbeat and is never listed.
+const isSideChatTitle = (text: string) => text === 'Side chat' || text.startsWith('btw: ')
+let isSideChat = false
+
 // Found once per load: ~/.claude/projects/<folder>/<session id>.jsonl.
 let transcriptPath: string | null = null
 
@@ -232,6 +237,13 @@ const readTitle = async ($: EngineInterface) => {
     transcriptPath = found?.stdout.trim().split('\n')[0] || null
   }
   if (!transcriptPath) return
+  if (!isSideChat) {
+    const id = await $.session.id()
+    const side = await $.process
+      .run(['grep', '-a', '-m', '1', '-o', '-E', `"customTitle":"(Side chat|btw: [^"]*)","sessionId":"${id}"`, transcriptPath], { timeoutMs: 5000 })
+      .catch(() => null)
+    isSideChat = side?.exitCode === 0
+  }
   const ran = await $.process
     .run(['grep', '-a', '-o', '-E', TITLE_PATTERN, transcriptPath], { timeoutMs: 5000 })
     .catch(() => null)
@@ -496,6 +508,10 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
     controls: CONTROLS,
     isSaved: turn !== null && savedAt === turn.at,
   }
+  if (isSideChat) {
+    await $.process.run(['rm', '-f', `${dir}/${id}.json`], { timeoutMs: 5000 }).catch(() => undefined)
+    return
+  }
   try {
     await $.fs.write(`${dir}/${id}.json`, JSON.stringify(beat))
   } catch {
@@ -513,7 +529,7 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
     } catch {
       continue
     }
-    if (now - other.at > PEER_ALIVE_MS) continue
+    if (now - other.at > PEER_ALIVE_MS || isSideChatTitle(other.label)) continue
     const row = rowOf(other, false, now)
     rows.push(row)
     const waiting = other.waiting ?? null
