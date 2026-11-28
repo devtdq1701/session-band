@@ -26,6 +26,9 @@ const saveBrainSentAt = atom({ plugin: 'session-band', key: 'saveBrainSentAt' } 
 // The running turn answers a save-brain prompt; savedTurnAt is the end of the last such turn.
 const isSaveTurn = atom({ plugin: 'session-band', key: 'isSaveTurn' } as const, false)
 const savedTurnAt = atom({ plugin: 'session-band', key: 'savedTurnAt' } as const, null)
+// The person's last prompt and the end of the last save-brain turn, for other bands' Details.
+const lastPrompt = atom({ plugin: 'session-band', key: 'lastPrompt' } as const, null)
+const lastSavedAt = atom({ plugin: 'session-band', key: 'lastSavedAt' } as const, null)
 const SAVE_BRAIN_TEXT = /^\s*save-brain\b/i
 // The peer the alert pane shows, and the options picked there so far by question text.
 const alertPeer = atom({ plugin: 'session-band', key: 'alertPeer' } as const, null)
@@ -182,6 +185,8 @@ const saveBrain = async ($: EngineInterface) => {
   }
   await update($, saveBrainSentAt, () => now)
   await say($, 'save-brain sent')
+  // This mod's prompt.submit hook never hears its own prompt, so the press marks the turn.
+  await update($, isSaveTurn, () => true)
   $.prompt.submit({ text: SAVE_BRAIN_PROMPT }).catch(err => {
     $.ui.toast(`save-brain failed: ${oneLine(String(err), 120)}`, { timeoutMs: 10_000 })
   })
@@ -482,7 +487,7 @@ const rowOf = (b: Beat, isSelf: boolean, now: number): SessionRow => {
 // Writes this session's heartbeat and reads every other live session's, so each session can
 // remind about the others' prompt caches and questions.
 const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
-  const [dir, handled, id, cwd, now, turn, working, name, appTitle, waits, savedAt] = await Promise.all([
+  const [dir, handled, id, cwd, now, turn, working, name, appTitle, waits, savedAt, prompt, lastSave, snap] = await Promise.all([
     beatsDir($),
     handledDir($),
     $.session.id(),
@@ -494,6 +499,9 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
     read($, title),
     read($, pending),
     read($, savedTurnAt),
+    read($, lastPrompt),
+    read($, lastSavedAt),
+    read($, snapshot),
   ])
   const folder = cwd.split('/').pop() || cwd
   const beat: Beat = {
@@ -507,6 +515,9 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
     waiting: waits[0] ?? null,
     controls: CONTROLS,
     isSaved: turn !== null && savedAt === turn.at,
+    lastPrompt: prompt,
+    savedAt: lastSave,
+    contextPercent: snap?.contextPercent ?? null,
   }
   if (isSideChat) {
     await $.process.run(['rm', '-f', `${dir}/${id}.json`], { timeoutMs: 5000 }).catch(() => undefined)
@@ -549,6 +560,9 @@ const syncPeers = async ($: EngineInterface, ttlMs: number, leadMs: number) => {
       coldInMs: row.coldInMs,
       waiting: null,
       hasControls,
+      lastPrompt: other.lastPrompt ?? null,
+      savedAt: other.savedAt ?? null,
+      contextPercent: other.contextPercent ?? null,
     })
   }
   await update($, peers, () => found)
@@ -680,6 +694,7 @@ export const register: Register = (on, options) => {
       const text = oneLine(e.text, 40)
       if (text && (await read($, label)) === null) await update($, label, () => text)
       if (text) await say($, `› ${oneLine(e.text, 60)}`)
+      if (text) await update($, lastPrompt, () => oneLine(e.text, 160))
     }
     const { cost } = await $.session.usage()
     await update($, turnCostStart, () => cost?.usd ?? null)
@@ -743,6 +758,7 @@ export const register: Register = (on, options) => {
       await clearPending($, null, ttlMs, leadMs)
       const isSave = await read($, isSaveTurn)
       await update($, savedTurnAt, () => (isSave ? at : null))
+      if (isSave) await update($, lastSavedAt, () => at)
       await update($, lastTurn, () => ({
         at,
         durationMs: e.durationMs,
@@ -1014,9 +1030,11 @@ export const register: Register = (on, options) => {
         </Box>
 
         {p.waiting === null && (
-          <Text>
-            {`The prompt cache of this session goes cold at ${clock(now + (p.coldInMs ?? 0))}. Save-brain writes a handoff so the next session can pick up; Compact shrinks the context so the next prompt costs less.`}
-          </Text>
+          <Box flexDirection="column">
+            <Text>{`Cache cold at ${clock(now + (p.coldInMs ?? 0))}${p.contextPercent != null ? ` · context ${p.contextPercent}%` : ''}`}</Text>
+            <Text dimColor>{p.savedAt != null ? `Last save-brain ${clock(p.savedAt)}` : 'No save-brain yet this session'}</Text>
+            {p.lastPrompt != null && <Text dimColor wrap="wrap">{`Last prompt: ${p.lastPrompt}`}</Text>}
+          </Box>
         )}
         {p.waiting !== null && questions.length === 0 && <Text>{p.waiting.summary || p.waiting.tool}</Text>}
 

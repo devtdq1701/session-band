@@ -365,6 +365,38 @@ test("Details opens an alert's pane, a second press closes it, another alert's p
   await band.unmount()
 })
 
+test("a cold alert's Details shows the peer's last prompt, last save-brain and context", async ($, on) => {
+  const files = new Map<string, string>()
+  engine(on, files, [])
+  const peer = { ...JSON.parse(beat('peer1', 'Peer one', -55 * 60_000)), lastPrompt: 'fix the login bug', savedAt: -50 * 60_000, contextPercent: 42 }
+  files.set(`${BEATS}/peer1.json`, JSON.stringify(peer))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+
+  const band = await $.ui.mount({ plugin: 'session-band', component: 'AbovePrompt', surface: 'desktop', props: BAND_PROPS })
+  await band.press({ key: 'open-peer1' })
+  const pane = await $.ui.mount(ALERT_PANE)
+  expect(await pane.find({ type: 'Text', text: /Last prompt: fix the login bug/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /Last save-brain/ })).toBeDefined()
+  expect(await pane.find({ type: 'Text', text: /context 42%/ })).toBeDefined()
+  await pane.unmount()
+  await band.unmount()
+})
+
+test("the person's prompt and a save-brain turn land in this session's heartbeat", async ($, on) => {
+  const files = new Map<string, string>()
+  const clock = engine(on, files, [])
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  await runTurn($, 'fix the login bug', 'composer')
+  press(files, 'save-brain', null)
+  await clock.advance(2500)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1000 } as never)
+
+  const me = JSON.parse(files.get(`${BEATS}/me.json`) ?? '{}')
+  expect(me.lastPrompt).toBe('fix the login bug')
+  expect(typeof me.savedAt).toBe('number')
+})
+
 test('Send answers pressed before every question has a pick says which one is missing', async ($, on) => {
   const files = new Map<string, string>()
   engine(on, files, [])
@@ -410,6 +442,21 @@ test('a save-brain turn leaves its idle period without a cold reminder, here and
   const ui = await $.ui.mount({ plugin: 'session-band', component: 'AbovePrompt', surface: 'desktop', props: BAND_PROPS })
   expect(await ui.find({ type: 'Text', text: /cold in/ })).toBeUndefined()
   await ui.unmount()
+})
+
+// The engine never hands a plugin's own $.prompt.submit to that plugin's prompt.submit hook,
+// so the turn a Save-brain press starts must be marked saved by the press itself.
+test('a Save-brain press marks the turn it starts as saved without hearing its own prompt', async ($, on) => {
+  const files = new Map<string, string>()
+  const clock = engine(on, files, [])
+  on('turn.complete', () => ({ text: '' }))
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  press(files, 'save-brain', null)
+  await clock.advance(2500)
+  await $.turn.complete({ reason: 'answer', answer: '', durationMs: 1000 } as never)
+  await clock.advance(55 * 60_000)
+
+  expect(JSON.parse(files.get(`${BEATS}/me.json`) ?? '{}').isSaved).toBe(true)
 })
 
 test('a prompt after save-brain brings the cold reminder back for its own idle period', async ($, on) => {

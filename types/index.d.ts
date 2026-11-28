@@ -61,6 +61,10 @@ export type Beat = {
   controls?: number
   // The last turn was a save-brain: its idle period needs no cold reminder. Absent on older code.
   isSaved?: boolean
+  // What the Details pane of a cold alert shows. Absent on older code.
+  lastPrompt?: string | null
+  savedAt?: number | null
+  contextPercent?: number | null
 }
 
 // One press in another session's band, written to this session's inbox and run here.
@@ -85,6 +89,10 @@ export type Peer = {
   waiting: Waiting | null
   // Whether the peer polls its inbox, so the band may draw buttons that act on it.
   hasControls: boolean
+  // From the peer's heartbeat, for the Details pane; absent on older code.
+  lastPrompt?: string | null
+  savedAt?: number | null
+  contextPercent?: number | null
 }
 
 // Every live session, this one included, for the deck's session list.
@@ -130,6 +138,8 @@ declare module 'claude-code' {
       saveBrainSentAt: number | null
       isSaveTurn: boolean
       savedTurnAt: number | null
+      lastPrompt: string | null
+      lastSavedAt: number | null
       hiddenAlerts: string[]
       alertPeer: string | null
       choices: Record<string, string[]>
